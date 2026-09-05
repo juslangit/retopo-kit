@@ -94,6 +94,36 @@ triangles, the same number in a different unit. Triangles are what the engine dr
 
 The reduced levels are hidden after building, since they sit exactly on top of LOD0.
 
+## Sculpts that Quadriflow refuses
+
+Quadriflow will not touch a mesh with non-manifold geometry — edges shared by three
+or more faces. Real sculpts have these constantly, and it takes only three of them
+in an 85,000-face model to make it refuse the lot. Open boundaries are fine; it is
+three-face edges it rejects.
+
+When that happens Retopo Kit remeshes with voxels instead, driven by the same quad
+size, so you still get a usable low-poly. The quads are laid out less neatly than
+Quadriflow would manage, and the report says so plainly:
+
+```
+LP_Thief_LOD0: 85,319 to 4,404 faces, UVs 58%, baked, voxels (not watertight), 3 LODs
+```
+
+The panel warns you before you press anything, and you can switch the fallback off
+if you would rather fix the mesh than accept voxel topology.
+
+## Testing on a real sculpt
+
+Blender publishes free sculpt demo files, which are far better test subjects than
+primitives:
+
+```bash
+curl -O https://download.blender.org/demo/sculpt_mode/01_sculpt_grab_silhouette.blend
+```
+
+Everything on this page was verified against that file's character sculpt, not only
+against spheres.
+
 ## Install
 
 Build the zip, then install that — **not** the loose `__init__.py`, which Blender

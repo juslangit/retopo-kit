@@ -24,7 +24,7 @@ The sculpt is never modified. The result is a new object named LP_<name>.
 bl_info = {
     "name": "Retopo Kit",
     "author": "Luqman Hakeem",
-    "version": (0, 5, 0),
+    "version": (0, 6, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar (N) > Retopo",
     "description": "Sculpt to game-ready: remesh, unwrap, bake, over a whole selection.",
@@ -33,6 +33,7 @@ bl_info = {
 
 import time
 
+import bmesh
 import bpy
 from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
                        PointerProperty, StringProperty)
@@ -43,6 +44,31 @@ from mathutils import Vector
 # --------------------------------------------------------------------------- #
 # Working out how many faces to ask for
 # --------------------------------------------------------------------------- #
+
+def nonmanifold_edges(mesh):
+    """How many edges are not shared by exactly two faces.
+
+    Quadriflow refuses any mesh with these, and real sculpts are full of them:
+    open holes, stray internal faces, badly welded geometry. Worth counting, so
+    the artist is told what is actually wrong instead of watching a button fail.
+    """
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    count = sum(1 for edge in bm.edges if not edge.is_manifold)
+    bm.free()
+    return count
+
+
+def ensure_object_mode(context):
+    """Leave whatever mode we are in, so the operators can do their work.
+
+    Artists arrive here straight out of Sculpt Mode, because that is where they
+    just finished the sculpt. Refusing to run in that case makes the button look
+    broken, so switch mode instead of demanding they do it.
+    """
+    if context.mode != "OBJECT" and context.active_object is not None:
+        bpy.ops.object.mode_set(mode="OBJECT")
+
 
 def surface_area(obj, depsgraph):
     """Total area of the object in square metres, with modifiers applied."""
@@ -121,6 +147,13 @@ class RETOPO_Settings(PropertyGroup):
                     "short and you get black patches; too long and rays hit the "
                     "far side of the model",
         default=2.0, min=0.01, max=100.0, soft_max=20.0)
+
+    voxel_fallback: BoolProperty(
+        name="Fall Back to Voxels", default=True,
+        description="Quadriflow refuses meshes that are not watertight, and most "
+                    "real sculpts are not. When that happens, remesh with voxels "
+                    "instead so you still get a usable result — the quads are laid "
+                    "out less neatly, but it works on anything")
 
     # --- step 5: LODs ---
     auto_lods: BoolProperty(
@@ -223,9 +256,10 @@ class RETOPO_OT_unwrap(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
+        return obj is not None and obj.type == "MESH"
 
     def execute(self, context):
+        ensure_object_mode(context)
         obj = context.active_object
         settings = context.scene.retopo
 
@@ -345,6 +379,10 @@ def bake_normal(context, low, high, settings):
 
     distance = ray_distance_cm(low, settings) / 100.0     # centimetres to metres
     bake = scene.render.bake
+    # Never inherit these from the file. A scene where someone last baked vertex
+    # colours will otherwise fail with "no active color attribute", which says
+    # nothing about the real problem.
+    bake.target = "IMAGE_TEXTURES"
     bake.use_selected_to_active = True
     bake.use_cage = False
     bake.cage_extrusion = distance
@@ -373,9 +411,10 @@ class RETOPO_OT_bake(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
+        return obj is not None and obj.type == "MESH"
 
     def execute(self, context):
+        ensure_object_mode(context)
         low = context.active_object
         settings = context.scene.retopo
 
@@ -482,9 +521,10 @@ class RETOPO_OT_lods(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
+        return obj is not None and obj.type == "MESH"
 
     def execute(self, context):
+        ensure_object_mode(context)
         settings = context.scene.retopo
         low = context.active_object
 
@@ -508,7 +548,7 @@ class Result:
     """What happened to one sculpt, so a batch can report on all of them."""
 
     __slots__ = ("source", "low", "before", "after", "coverage", "baked",
-                 "lods", "problem")
+                 "lods", "fallback", "problem")
 
     def __init__(self, source):
         self.source = source
@@ -518,6 +558,7 @@ class Result:
         self.coverage = None
         self.baked = False
         self.lods = 0
+        self.fallback = False
         self.problem = None
 
     @property
@@ -538,7 +579,8 @@ def process(context, source, settings, report=None):
         result.problem = "no surface area"
         return result
 
-    target = faces_for_quad_size(area, effective_quad_size(settings))
+    quad_size = effective_quad_size(settings)
+    target = faces_for_quad_size(area, quad_size)
 
     # Work on a copy so the sculpt is never damaged.
     low = source.copy()
@@ -555,7 +597,7 @@ def process(context, source, settings, report=None):
     context.view_layer.objects.active = low
 
     try:
-        bpy.ops.object.quadriflow_remesh(
+        outcome = bpy.ops.object.quadriflow_remesh(
             mode="FACES",
             target_faces=target,
             use_mesh_symmetry=settings.use_symmetry,
@@ -563,10 +605,35 @@ def process(context, source, settings, report=None):
             use_preserve_boundary=True,
             smooth_normals=True,
         )
-    except RuntimeError as exc:
-        bpy.data.objects.remove(low, do_unlink=True)
-        result.problem = "remesh failed (%s)" % exc
-        return result
+    except RuntimeError:
+        outcome = {"CANCELLED"}
+
+    # Quadriflow cancels rather than raising when it dislikes a mesh. Ignoring
+    # that leaves an unremeshed copy that looks like a result and then bakes a
+    # flat, useless normal map from it — the worst kind of failure, because
+    # nothing appears to have gone wrong.
+    if "FINISHED" not in outcome:
+        bad = nonmanifold_edges(low.data)
+        if not settings.voxel_fallback:
+            bpy.data.objects.remove(low, do_unlink=True)
+            result.problem = ("Quadriflow refused it — %s edges are not watertight. "
+                              "Switch on Fall Back to Voxels, or close the holes"
+                              % f"{bad:,}")
+            return result
+
+        # Voxels do not care about holes. The same quad size drives the voxel
+        # size, so the artist's one setting still means what it said.
+        low.data.remesh_voxel_size = max(quad_size / 100.0, 0.0005)
+        low.data.remesh_voxel_adaptivity = 0.0
+        try:
+            voxel_outcome = bpy.ops.object.voxel_remesh()
+        except RuntimeError:
+            voxel_outcome = {"CANCELLED"}
+        if "FINISHED" not in voxel_outcome:
+            bpy.data.objects.remove(low, do_unlink=True)
+            result.problem = "neither Quadriflow nor voxel remeshing would take it"
+            return result
+        result.fallback = True
 
     result.low = low
     result.after = len(low.data.polygons)
@@ -610,6 +677,8 @@ def describe(result):
         parts.append("UVs %.0f%%" % result.coverage)
     if result.baked:
         parts.append("baked")
+    if result.fallback:
+        parts.append("voxels (not watertight)")
     if result.lods:
         parts.append("%d LODs" % result.lods)
     return "%s: %s" % (result.low.name, ", ".join(parts))
@@ -624,9 +693,10 @@ class RETOPO_OT_remesh(Operator):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
+        return obj is not None and obj.type == "MESH"
 
     def execute(self, context):
+        ensure_object_mode(context)
         settings = context.scene.retopo
         result = process(context, context.active_object, settings)
 
@@ -648,10 +718,10 @@ class RETOPO_OT_batch(Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.mode == "OBJECT" and any(
-            o.type == "MESH" for o in context.selected_objects)
+        return any(o.type == "MESH" for o in context.selected_objects)
 
     def execute(self, context):
+        ensure_object_mode(context)
         settings = context.scene.retopo
         window = context.window_manager
 
@@ -714,6 +784,7 @@ class RETOPO_PT_main(Panel):
         column.prop(settings, "use_symmetry")
         column.prop(settings, "preserve_sharp")
         column.prop(settings, "keep_original")
+        column.prop(settings, "voxel_fallback")
 
         layout.separator()
 
@@ -726,6 +797,15 @@ class RETOPO_PT_main(Panel):
             box.label(text="Surface area: %.2f m2" % area)
             box.label(text="Faces now: %s" % f"{len(obj.data.polygons):,}")
             box.label(text="Aiming for: %s" % f"{target:,}")
+
+            # Checking this is cheap next to finding out after a failed bake.
+            bad = nonmanifold_edges(obj.data)
+            if bad:
+                row = box.row()
+                row.label(text="%s open edges — will use voxels"
+                               % f"{bad:,}" if settings.voxel_fallback
+                          else "%s open edges — Quadriflow will refuse" % f"{bad:,}",
+                          icon="ERROR")
 
         big = layout.column(align=True)
         big.scale_y = 1.5

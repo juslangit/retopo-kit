@@ -7,6 +7,9 @@
 # Build output
 dist/
 
+# Test assets downloaded from blender.org — large, and not ours to redistribute
+testdata/
+
 # Python
 __pycache__/
 *.py[cod]

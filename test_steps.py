@@ -241,6 +241,71 @@ check("LP_Whole_LOD2" in bpy.data.objects, "chain produced LOD2")
 check(bpy.data.images.get("LP_Whole_Normal") is not None, "chain produced the normal map")
 check("LODs" in s.last_report, "the summary mentions every stage: '%s'" % s.last_report)
 
+# --- meshes Quadriflow refuses, which real sculpts often are ---------------
+def nonmanifold_sphere(name="Messy"):
+    """A closed sphere with one extra face welded onto an existing edge.
+
+    That single addition gives three edges with three faces each, which is all
+    it takes for Quadriflow to refuse the whole mesh. Deleting faces would not
+    do it — Quadriflow tolerates open boundaries, it is three-face edges it
+    will not touch. This mirrors what the Blender demo sculpt does.
+    """
+    import bmesh as _bm
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, segments=96, ring_count=48)
+    obj = bpy.context.active_object
+    obj.name = name
+    bpy.ops.object.modifier_add(type="SUBSURF")
+    obj.modifiers["Subdivision"].levels = 1
+    bpy.ops.object.modifier_apply(modifier="Subdivision")
+    bm = _bm.new(); bm.from_mesh(obj.data)
+    bm.verts.ensure_lookup_table(); bm.edges.ensure_lookup_table()
+    edge = bm.edges[10]
+    far = max(bm.verts, key=lambda v: (v.co - edge.verts[0].co).length)
+    bm.faces.new((edge.verts[0], edge.verts[1], far))
+    bm.to_mesh(obj.data); bm.free(); obj.data.update()
+    return obj
+
+obj = nonmanifold_sphere()
+bad = retopo_kit.nonmanifold_edges(obj.data)
+check(bad > 0, "the test mesh really is non-manifold (%d edges)" % bad)
+
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake, s.auto_lods = "BACKGROUND", True, False, False
+s.voxel_fallback = True
+before = len(obj.data.polygons)
+check(bpy.ops.retopo.remesh() == {"FINISHED"},
+      "a mesh Quadriflow refuses still produces a low-poly")
+low = bpy.data.objects.get("LP_Messy")
+check(low is not None and len(low.data.polygons) < before / 2,
+      "the fallback reduced it (%s to %s faces)"
+      % (f"{before:,}", f"{len(low.data.polygons):,}" if low else "none"))
+check("voxels" in s.last_report, "the report says voxels were used: '%s'" % s.last_report)
+
+# with the fallback off it must fail loudly, not silently pass the sculpt through
+nonmanifold_sphere("Messy2")
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake, s.auto_lods = "PROP", False, False, False
+s.voxel_fallback = False
+try:
+    outcome = bpy.ops.retopo.remesh()
+    refused = outcome == {"CANCELLED"}
+except RuntimeError as exc:
+    refused = "not watertight" in str(exc)
+check(refused, "without the fallback it refuses instead of faking a result")
+check("LP_Messy2" not in bpy.data.objects, "and leaves no half-made object behind")
+
+# the bake must not inherit a vertex-colour target from the file
+bpy.ops.wm.read_factory_settings(use_empty=True)
+bpy.context.scene.render.bake.target = "VERTEX_COLORS"
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake, s.auto_lods = "PROP", True, True, False
+s.texture_size, s.voxel_fallback = "1024", True
+bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, segments=48, ring_count=24)
+bpy.context.active_object.name = "VC"
+check(bpy.ops.retopo.remesh() == {"FINISHED"},
+      "baking works even when the file was set to vertex colours")
+
 print("\n%d check(s), %d failure(s)" % (checks, len(failures)))
 if failures:
     for f in failures: print("FAILED: " + f)
