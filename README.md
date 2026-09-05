@@ -10,14 +10,14 @@ Retopo Kit uses that remesher as its engine and does the rest of the chain.
 
 ## Status
 
-**In development.** Steps 1 to 3 of 5 work.
+**In development.** Steps 1 to 4 of 5 work.
 
 | Step | What it does | Status |
 |---|---|---|
 | 1 | Remesh, asking for quad size in cm instead of a face count | ✅ done |
 | 2 | Automatic UV unwrap on the low-poly | ✅ done |
 | 3 | Bake the sculpt's detail into a normal map | ✅ done |
-| 4 | Run the whole chain over a selection, not one object | planned |
+| 4 | Run the whole chain over a selection, not one object | ✅ done |
 | 5 | Generate LODs with Unreal's naming | planned |
 
 ## Step 1 — remesh by quad size
@@ -66,6 +66,18 @@ than being an image nobody ever sees.
 
 Baking needs Cycles. The add-on borrows the render engine for the bake and hands it
 back afterwards.
+
+## Step 4 — do a whole selection
+
+Select any number of sculpts and press **Do All Selected**. Each one gets remeshed,
+unwrapped and baked in turn, with its own normal map.
+
+One bad object does not stop the run. It is reported and the batch carries on, so
+a folder of forty props does not fail on number seven and leave you guessing.
+Low-polys are skipped, so running it twice cannot produce `LP_LP_Rock`.
+
+Every button goes through the same code path as the batch, so the single-object
+case and the forty-object case cannot behave differently.
 
 ## Install
 

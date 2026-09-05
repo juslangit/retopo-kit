@@ -12,23 +12,27 @@ Step 3, bake: the sculpt's detail is projected onto the low-poly as a normal map
 with the ray distance worked out from the model's own size rather than left as a
 number to guess at.
 
+Step 4, batch: the whole chain runs over every selected sculpt, and one bad object
+reports itself instead of stopping the rest.
+
 The sculpt is never modified. The result is a new object named LP_<name>.
 """
 
 bl_info = {
     "name": "Retopo Kit",
     "author": "Luqman Hakeem",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar (N) > Retopo",
-    "description": "Sculpt to game-ready: remesh, unwrap and bake the detail down.",
+    "description": "Sculpt to game-ready: remesh, unwrap, bake, over a whole selection.",
     "category": "Mesh",
 }
 
 import time
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty
+from bpy.props import (BoolProperty, EnumProperty, FloatProperty,
+                       PointerProperty, StringProperty)
 from bpy.types import Operator, Panel, PropertyGroup
 from mathutils import Vector
 
@@ -114,6 +118,8 @@ class RETOPO_Settings(PropertyGroup):
                     "short and you get black patches; too long and rays hit the "
                     "far side of the model",
         default=2.0, min=0.01, max=100.0, soft_max=20.0)
+
+    last_report: StringProperty(default="")
 
     seam_angle: FloatProperty(
         name="Seam Angle",
@@ -394,6 +400,106 @@ def find_source(context, low):
 # Step 1 — the remesh operator
 # --------------------------------------------------------------------------- #
 
+class Result:
+    """What happened to one sculpt, so a batch can report on all of them."""
+
+    __slots__ = ("source", "low", "before", "after", "coverage", "baked", "problem")
+
+    def __init__(self, source):
+        self.source = source
+        self.low = None
+        self.before = len(source.data.polygons)
+        self.after = 0
+        self.coverage = None
+        self.baked = False
+        self.problem = None
+
+    @property
+    def ok(self):
+        return self.low is not None and self.problem is None
+
+
+def process(context, source, settings, report=None):
+    """Run the whole chain on one sculpt: remesh, then unwrap, then bake.
+
+    Everything the buttons do goes through here, so the single-object button and
+    the batch cannot drift apart. Never raises — failures land on the Result.
+    """
+    result = Result(source)
+
+    area = surface_area(source, context.evaluated_depsgraph_get())
+    if area <= 0.0:
+        result.problem = "no surface area"
+        return result
+
+    target = faces_for_quad_size(area, effective_quad_size(settings))
+
+    # Work on a copy so the sculpt is never damaged.
+    low = source.copy()
+    low.data = source.data.copy()
+    low.name = "LP_" + source.name
+    low.data.name = "LP_" + source.name
+    low["retopo_source"] = source.name      # step 3 reads this to find the sculpt
+    for collection in source.users_collection:
+        collection.objects.link(low)
+
+    for obj in context.selected_objects:
+        obj.select_set(False)
+    low.select_set(True)
+    context.view_layer.objects.active = low
+
+    try:
+        bpy.ops.object.quadriflow_remesh(
+            mode="FACES",
+            target_faces=target,
+            use_mesh_symmetry=settings.use_symmetry,
+            use_preserve_sharp=settings.preserve_sharp,
+            use_preserve_boundary=True,
+            smooth_normals=True,
+        )
+    except RuntimeError as exc:
+        bpy.data.objects.remove(low, do_unlink=True)
+        result.problem = "remesh failed (%s)" % exc
+        return result
+
+    result.low = low
+    result.after = len(low.data.polygons)
+
+    if settings.auto_unwrap:
+        try:
+            _seams, result.coverage = unwrap_object(low, settings)
+        except RuntimeError as exc:
+            result.problem = "unwrap failed (%s)" % exc
+            return result
+
+        if settings.auto_bake:
+            try:
+                bake_normal(context, low, source, settings)
+                result.baked = True
+            except RuntimeError as exc:
+                result.problem = "bake failed (%s)" % exc
+                return result
+
+    if settings.keep_original:
+        source.hide_set(True)
+    else:
+        bpy.data.objects.remove(source, do_unlink=True)
+
+    return result
+
+
+def describe(result):
+    """One line an artist can read, for the status bar or the batch summary."""
+    if not result.ok:
+        return "%s: %s" % (result.source.name, result.problem)
+    parts = ["%s to %s faces" % (f"{result.before:,}", f"{result.after:,}")]
+    if result.coverage is not None:
+        parts.append("UVs %.0f%%" % result.coverage)
+    if result.baked:
+        parts.append("baked")
+    return "%s: %s" % (result.low.name, ", ".join(parts))
+
+
 class RETOPO_OT_remesh(Operator):
     bl_idname = "retopo.remesh"
     bl_label = "Make Low Poly"
@@ -407,75 +513,66 @@ class RETOPO_OT_remesh(Operator):
 
     def execute(self, context):
         settings = context.scene.retopo
-        source = context.active_object
-        depsgraph = context.evaluated_depsgraph_get()
+        result = process(context, context.active_object, settings)
 
-        area = surface_area(source, depsgraph)
-        if area <= 0.0:
-            self.report({"ERROR"}, "That mesh has no surface area")
+        settings.last_report = describe(result)
+        if not result.ok:
+            self.report({"ERROR"}, settings.last_report)
             return {"CANCELLED"}
 
-        quad_size = effective_quad_size(settings)
-        target = faces_for_quad_size(area, quad_size)
-        before = len(source.data.polygons)
-
-        # Work on a copy so the sculpt is never damaged.
-        low = source.copy()
-        low.data = source.data.copy()
-        low.name = "LP_" + source.name
-        low.data.name = "LP_" + source.name
-        low["retopo_source"] = source.name   # step 3 reads this to find the sculpt
-        for collection in source.users_collection:
-            collection.objects.link(low)
-
-        for obj in context.view_layer.objects:
-            obj.select_set(False)
-        low.select_set(True)
-        context.view_layer.objects.active = low
-
-        try:
-            bpy.ops.object.quadriflow_remesh(
-                mode="FACES",
-                target_faces=target,
-                use_mesh_symmetry=settings.use_symmetry,
-                use_preserve_sharp=settings.preserve_sharp,
-                use_preserve_boundary=True,
-                smooth_normals=True,
-            )
-        except RuntimeError as exc:
-            bpy.data.objects.remove(low, do_unlink=True)
-            source.select_set(True)
-            context.view_layer.objects.active = source
-            self.report({"ERROR"}, "Remesh failed: %s" % exc)
-            return {"CANCELLED"}
-
-        after = len(low.data.polygons)
-
-        unwrapped = ""
-        if settings.auto_unwrap:
-            try:
-                _seams, coverage = unwrap_object(low, settings)
-                unwrapped = ", UVs %.0f%% packed" % coverage
-            except RuntimeError as exc:
-                self.report({"WARNING"}, "Remeshed, but the unwrap failed: %s" % exc)
-
-            if settings.auto_bake:
-                try:
-                    bake_normal(context, low, source, settings)
-                    unwrapped += ", detail baked"
-                except RuntimeError as exc:
-                    self.report({"WARNING"}, "Unwrapped, but the bake failed: %s" % exc)
-
-        if settings.keep_original:
-            source.hide_set(True)
-        else:
-            bpy.data.objects.remove(source, do_unlink=True)
-
-        self.report(
-            {"INFO"},
-            "%s: %s faces to %s (%.1f cm quads, %.2f m2)%s"
-            % (low.name, f"{before:,}", f"{after:,}", quad_size, area, unwrapped))
+        self.report({"INFO"}, settings.last_report)
         return {"FINISHED"}
+
+
+class RETOPO_OT_batch(Operator):
+    bl_idname = "retopo.batch"
+    bl_label = "Do All Selected"
+    bl_description = ("Run the whole chain over every selected sculpt, one after "
+                      "another")
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT" and any(
+            o.type == "MESH" for o in context.selected_objects)
+
+    def execute(self, context):
+        settings = context.scene.retopo
+        window = context.window_manager
+
+        # Take the list now: the loop creates new objects and changes selection.
+        sculpts = [o for o in context.selected_objects
+                   if o.type == "MESH" and not o.name.startswith("LP_")]
+        if not sculpts:
+            self.report({"WARNING"},
+                        "Nothing to do — select the sculpts, not the low-polys")
+            return {"CANCELLED"}
+
+        started = time.time()
+        results = []
+        window.progress_begin(0, len(sculpts))
+        try:
+            for index, source in enumerate(sculpts):
+                window.progress_update(index)
+                results.append(process(context, source, settings))
+        finally:
+            window.progress_end()
+
+        done = [r for r in results if r.ok]
+        failed = [r for r in results if not r.ok]
+
+        for result in failed:
+            self.report({"WARNING"}, describe(result))
+        for result in results:
+            print("[Retopo Kit] " + describe(result))
+
+        settings.last_report = "%d of %d done in %.0fs" % (
+            len(done), len(results), time.time() - started)
+        if failed:
+            settings.last_report += " — %d failed" % len(failed)
+
+        self.report({"INFO"}, settings.last_report)
+        return {"FINISHED"} if done else {"CANCELLED"}
 
 
 # --------------------------------------------------------------------------- #
@@ -515,9 +612,22 @@ class RETOPO_PT_main(Panel):
             box.label(text="Faces now: %s" % f"{len(obj.data.polygons):,}")
             box.label(text="Aiming for: %s" % f"{target:,}")
 
-        big = layout.column()
+        big = layout.column(align=True)
         big.scale_y = 1.5
         big.operator("retopo.remesh", icon="MOD_REMESH")
+
+        selected = sum(1 for o in context.selected_objects
+                       if o.type == "MESH" and not o.name.startswith("LP_"))
+        row = layout.row()
+        row.scale_y = 1.2
+        row.enabled = selected > 1
+        row.operator("retopo.batch",
+                     text="Do All Selected (%d)" % selected if selected > 1
+                     else "Do All Selected",
+                     icon="DUPLICATE")
+
+        if settings.last_report:
+            layout.label(text=settings.last_report, icon="INFO")
 
 
 class RETOPO_PT_unwrap(Panel):
@@ -572,7 +682,8 @@ class RETOPO_PT_bake(Panel):
         layout.operator("retopo.bake", icon="RENDER_STILL")
 
 
-CLASSES = (RETOPO_Settings, RETOPO_OT_remesh, RETOPO_OT_unwrap, RETOPO_OT_bake,
+CLASSES = (RETOPO_Settings,
+           RETOPO_OT_remesh, RETOPO_OT_batch, RETOPO_OT_unwrap, RETOPO_OT_bake,
            RETOPO_PT_main, RETOPO_PT_unwrap, RETOPO_PT_bake)
 
 

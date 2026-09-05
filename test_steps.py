@@ -144,6 +144,53 @@ check(bpy.context.scene.render.engine == engine_before,
       "render engine handed back (%s)" % bpy.context.scene.render.engine)
 check(bpy.data.objects["Bumpy"].hide_get(), "the sculpt was hidden again after baking")
 
+# --- step 4: the batch ----------------------------------------------------
+bpy.ops.wm.read_factory_settings(use_empty=True)
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake = "PROP", True, False
+
+names = ["Rock", "Barrel", "Crate"]
+for i, name in enumerate(names):
+    bpy.ops.mesh.primitive_uv_sphere_add(radius=0.4, segments=32, ring_count=16,
+                                         location=(i * 2.0, 0, 0))
+    bpy.context.active_object.name = name
+
+for obj in bpy.context.view_layer.objects:
+    obj.select_set(obj.name in names)
+bpy.context.view_layer.objects.active = bpy.data.objects["Rock"]
+
+result = bpy.ops.retopo.batch()
+check(result == {"FINISHED"}, "batch finished")
+made = [n for n in names if ("LP_" + n) in bpy.data.objects]
+check(len(made) == 3, "all three were processed (%d of 3)" % len(made))
+check(all(bpy.data.objects["LP_" + n].data.uv_layers for n in names),
+      "every low-poly got UVs")
+check(all(bpy.data.objects[n].hide_get() for n in names), "every sculpt was hidden")
+check("3 of 3 done" in s.last_report, "summary reads '%s'" % s.last_report)
+
+# a broken object must not stop the rest of the batch
+bpy.ops.wm.read_factory_settings(use_empty=True)
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake = "PROP", False, False
+bpy.ops.mesh.primitive_uv_sphere_add(radius=0.4, segments=32, ring_count=16)
+bpy.context.active_object.name = "Good"
+empty_mesh = bpy.data.meshes.new("Empty")
+broken = bpy.data.objects.new("Broken", empty_mesh)   # no faces at all
+bpy.context.scene.collection.objects.link(broken)
+bpy.context.view_layer.update()      # the new object is not selectable until this
+broken.select_set(True)
+bpy.data.objects["Good"].select_set(True)
+bpy.context.view_layer.objects.active = broken
+bpy.ops.retopo.batch()
+check("LP_Good" in bpy.data.objects, "a broken object did not stop the batch")
+check("failed" in s.last_report, "the failure was reported ('%s')" % s.last_report)
+
+# low-polys are skipped, so running twice does not make LP_LP_
+for obj in bpy.context.view_layer.objects:
+    obj.select_set(True)
+bpy.ops.retopo.batch()
+check("LP_LP_Good" not in bpy.data.objects, "low-polys are not re-processed")
+
 print("\n%d check(s), %d failure(s)" % (checks, len(failures)))
 if failures:
     for f in failures: print("FAILED: " + f)
