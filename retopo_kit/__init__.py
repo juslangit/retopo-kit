@@ -8,22 +8,29 @@ question an artist can answer, and works the count out from the surface area.
 Step 2, unwrap: the low-poly gets UVs immediately, sized for the texture it will be
 baked into, because nothing further in the chain can happen without them.
 
+Step 3, bake: the sculpt's detail is projected onto the low-poly as a normal map,
+with the ray distance worked out from the model's own size rather than left as a
+number to guess at.
+
 The sculpt is never modified. The result is a new object named LP_<name>.
 """
 
 bl_info = {
     "name": "Retopo Kit",
     "author": "Luqman Hakeem",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar (N) > Retopo",
-    "description": "Sculpt to game-ready: remesh and unwrap, with baking and LODs to come.",
+    "description": "Sculpt to game-ready: remesh, unwrap and bake the detail down.",
     "category": "Mesh",
 }
+
+import time
 
 import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, PointerProperty
 from bpy.types import Operator, Panel, PropertyGroup
+from mathutils import Vector
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +99,22 @@ class RETOPO_Settings(PropertyGroup):
         items=[("1024", "1K", "1024 x 1024"),
                ("2048", "2K", "2048 x 2048"),
                ("4096", "4K", "4096 x 4096")])
+    # --- step 3: bake ---
+    auto_bake: BoolProperty(
+        name="Bake After Unwrap", default=False,
+        description="Project the sculpt's detail onto the low-poly straight away. "
+                    "Off by default because baking is the slow step")
+    cage_auto: BoolProperty(
+        name="Work Out Ray Distance", default=True,
+        description="Derive how far the rays travel from the model's own size. "
+                    "Turn this off only if the bake comes out wrong")
+    cage_distance: FloatProperty(
+        name="Ray Distance (cm)",
+        description="How far outside the low-poly to search for the sculpt. Too "
+                    "short and you get black patches; too long and rays hit the "
+                    "far side of the model",
+        default=2.0, min=0.01, max=100.0, soft_max=20.0)
+
     seam_angle: FloatProperty(
         name="Seam Angle",
         description="How sharp a bend has to be before the UVs are cut there. "
@@ -194,6 +217,180 @@ class RETOPO_OT_unwrap(Operator):
 
 
 # --------------------------------------------------------------------------- #
+# Step 3 — baking the detail down
+# --------------------------------------------------------------------------- #
+
+def diagonal_cm(obj):
+    """Length of the object's bounding box diagonal, in centimetres."""
+    corners = [obj.matrix_world @ Vector(c) for c in obj.bound_box]
+    low = Vector((min(c[i] for c in corners) for i in range(3)))
+    high = Vector((max(c[i] for c in corners) for i in range(3)))
+    return (high - low).length * 100.0
+
+
+def ray_distance_cm(obj, settings):
+    """How far the bake rays should travel, in centimetres.
+
+    Two percent of the model's diagonal catches the sculpt's detail without the
+    rays reaching far enough to hit the opposite side of the model.
+    """
+    if not settings.cage_auto:
+        return settings.cage_distance
+    return max(0.2, diagonal_cm(obj) * 0.02)
+
+
+def ensure_material(obj, name):
+    """Give the object a material with nodes, reusing one if it already has it."""
+    if obj.data.materials and obj.data.materials[0] is not None:
+        material = obj.data.materials[0]
+    else:
+        material = bpy.data.materials.new(name)
+        obj.data.materials.append(material)
+    material.use_nodes = True
+    return material
+
+
+def wire_normal_map(material, image):
+    """Plug the baked image into the shader so the detail is actually visible.
+
+    Without this the bake produces a picture nobody ever sees.
+    """
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    texture = next((n for n in nodes
+                    if n.type == "TEX_IMAGE" and n.image is image), None)
+    if texture is None:
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.image = image
+        texture.location = (-700, -200)
+    texture.image.colorspace_settings.name = "Non-Color"
+
+    normal_map = next((n for n in nodes if n.type == "NORMAL_MAP"), None)
+    if normal_map is None:
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        normal_map.location = (-420, -200)
+
+    principled = next((n for n in nodes if n.type == "BSDF_PRINCIPLED"), None)
+
+    links.new(texture.outputs["Color"], normal_map.inputs["Color"])
+    if principled is not None:
+        links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
+
+    nodes.active = texture       # the bake writes into whichever node is active
+    return texture
+
+
+def bake_normal(context, low, high, settings):
+    """Project high's surface detail onto low as a normal map. Returns the image."""
+    scene = context.scene
+    size = int(settings.texture_size)
+
+    image_name = low.name + "_Normal"
+    image = bpy.data.images.get(image_name)
+    if image is None or tuple(image.size) != (size, size):
+        if image is not None:
+            bpy.data.images.remove(image)
+        image = bpy.data.images.new(image_name, size, size, alpha=False,
+                                    float_buffer=False, is_data=True)
+
+    material = ensure_material(low, low.name + "_Material")
+    wire_normal_map(material, image)
+
+    # Baking is Cycles-only, so borrow the engine and hand it back afterwards.
+    previous_engine = scene.render.engine
+    previous_samples = getattr(scene.cycles, "samples", None) if hasattr(scene, "cycles") else None
+    if scene.render.engine != "CYCLES":
+        try:
+            scene.render.engine = "CYCLES"
+        except TypeError:
+            raise RuntimeError("Cycles is not enabled — baking needs it")
+    if hasattr(scene, "cycles"):
+        scene.cycles.samples = 1      # a normal bake reads geometry, not light
+
+    was_hidden = high.hide_get()
+    high.hide_set(False)
+    high.hide_render = False
+
+    for obj in context.view_layer.objects:
+        obj.select_set(False)
+    high.select_set(True)
+    low.select_set(True)
+    context.view_layer.objects.active = low
+
+    distance = ray_distance_cm(low, settings) / 100.0     # centimetres to metres
+    bake = scene.render.bake
+    bake.use_selected_to_active = True
+    bake.use_cage = False
+    bake.cage_extrusion = distance
+    bake.max_ray_distance = distance * 2.0
+    bake.margin = max(2, size // 512)
+    bake.use_clear = True
+
+    try:
+        bpy.ops.object.bake(type="NORMAL", normal_space="TANGENT")
+    finally:
+        high.hide_set(was_hidden)
+        scene.render.engine = previous_engine
+        if previous_samples is not None:
+            scene.cycles.samples = previous_samples
+
+    image.pack()      # keep it inside the .blend so it cannot be lost
+    return image
+
+
+class RETOPO_OT_bake(Operator):
+    bl_idname = "retopo.bake"
+    bl_label = "Bake Detail"
+    bl_description = "Project the sculpt's detail onto the low-poly as a normal map"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
+
+    def execute(self, context):
+        low = context.active_object
+        settings = context.scene.retopo
+
+        high = find_source(context, low)
+        if high is None:
+            self.report({"ERROR"},
+                        "Cannot tell which sculpt to bake from. Select the sculpt "
+                        "as well, with the low-poly active")
+            return {"CANCELLED"}
+        if not low.data.uv_layers:
+            self.report({"ERROR"}, "%s has no UVs — unwrap it first" % low.name)
+            return {"CANCELLED"}
+
+        started = time.time()
+        try:
+            image = bake_normal(context, low, high, settings)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, "Bake failed: %s" % exc)
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, "%s baked from %s in %.1fs (%d px, %.1f cm rays)"
+                    % (image.name, high.name, time.time() - started,
+                       image.size[0], ray_distance_cm(low, settings)))
+        return {"FINISHED"}
+
+
+def find_source(context, low):
+    """Work out which object is the sculpt this low-poly came from.
+
+    The remesh records it on the object, so the usual case needs no selection at
+    all. Failing that, fall back to whatever else the artist has selected.
+    """
+    recorded = low.get("retopo_source")
+    if recorded and recorded in bpy.data.objects:
+        return bpy.data.objects[recorded]
+    others = [o for o in context.selected_objects if o is not low and o.type == "MESH"]
+    return others[0] if len(others) == 1 else None
+
+
+# --------------------------------------------------------------------------- #
 # Step 1 — the remesh operator
 # --------------------------------------------------------------------------- #
 
@@ -227,6 +424,7 @@ class RETOPO_OT_remesh(Operator):
         low.data = source.data.copy()
         low.name = "LP_" + source.name
         low.data.name = "LP_" + source.name
+        low["retopo_source"] = source.name   # step 3 reads this to find the sculpt
         for collection in source.users_collection:
             collection.objects.link(low)
 
@@ -260,6 +458,13 @@ class RETOPO_OT_remesh(Operator):
                 unwrapped = ", UVs %.0f%% packed" % coverage
             except RuntimeError as exc:
                 self.report({"WARNING"}, "Remeshed, but the unwrap failed: %s" % exc)
+
+            if settings.auto_bake:
+                try:
+                    bake_normal(context, low, source, settings)
+                    unwrapped += ", detail baked"
+                except RuntimeError as exc:
+                    self.report({"WARNING"}, "Unwrapped, but the bake failed: %s" % exc)
 
         if settings.keep_original:
             source.hide_set(True)
@@ -339,8 +544,36 @@ class RETOPO_PT_unwrap(Panel):
         layout.operator("retopo.unwrap", icon="MOD_UVPROJECT")
 
 
-CLASSES = (RETOPO_Settings, RETOPO_OT_remesh, RETOPO_OT_unwrap,
-           RETOPO_PT_main, RETOPO_PT_unwrap)
+class RETOPO_PT_bake(Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Retopo"
+    bl_label = "Detail"
+    bl_parent_id = "RETOPO_PT_main"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.retopo
+        obj = context.active_object
+
+        layout.prop(settings, "auto_bake")
+        layout.prop(settings, "cage_auto")
+        row = layout.row()
+        row.enabled = not settings.cage_auto
+        row.prop(settings, "cage_distance")
+
+        if obj is not None and obj.type == "MESH":
+            source = find_source(context, obj)
+            box = layout.box()
+            box.label(text="Sculpt: %s" % (source.name if source else "not found"),
+                      icon="OUTLINER_OB_MESH" if source else "ERROR")
+            box.label(text="Rays travel: %.1f cm" % ray_distance_cm(obj, settings))
+
+        layout.operator("retopo.bake", icon="RENDER_STILL")
+
+
+CLASSES = (RETOPO_Settings, RETOPO_OT_remesh, RETOPO_OT_unwrap, RETOPO_OT_bake,
+           RETOPO_PT_main, RETOPO_PT_unwrap, RETOPO_PT_bake)
 
 
 def register():

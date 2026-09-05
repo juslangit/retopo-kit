@@ -89,7 +89,63 @@ except RuntimeError as exc:
     refused = "remesh it before" in str(exc)
 check(refused, "refuses to unwrap a mesh that is still dense")
 
+
+# --- step 3: the bake -----------------------------------------------------
+import time
+bpy.ops.preferences.addon_enable(module="cycles")   # off under --factory-startup
+
+sculpt("Bumpy")
+s = bpy.context.scene.retopo
+high = bpy.context.active_object
+# give the sculpt real surface detail, so a flat bake would be obviously wrong
+bpy.ops.object.modifier_add(type="DISPLACE")
+tex = bpy.data.textures.new("Bumps", type="CLOUDS")
+tex.noise_scale = 0.15
+high.modifiers["Displace"].texture = tex
+high.modifiers["Displace"].strength = 0.08
+bpy.ops.object.modifier_apply(modifier="Displace")
+
+s.preset = "PROP"
+s.auto_unwrap = True
+s.auto_bake = False
+s.texture_size = "1024"
+bpy.ops.retopo.remesh()
+low = bpy.data.objects["LP_Bumpy"]
+check(low.get("retopo_source") == "Bumpy", "low-poly remembers which sculpt it came from")
+
+bpy.context.view_layer.objects.active = low
+engine_before = bpy.context.scene.render.engine
+started = time.time()
+result = bpy.ops.retopo.bake()
+check(result == {"FINISHED"}, "bake finished in %.1fs" % (time.time() - started))
+
+img = bpy.data.images.get("LP_Bumpy_Normal")
+check(img is not None, "normal map image was created")
+if img:
+    check(tuple(img.size) == (1024, 1024), "image is the requested size %s" % (tuple(img.size),))
+    px = list(img.pixels)
+    # A flat normal map is uniform lilac (0.5, 0.5, 1.0). Real detail varies.
+    reds = px[0::4]
+    spread = max(reds) - min(reds)
+    check(spread > 0.05, "the map carries real detail, not a flat surface (spread %.2f)" % spread)
+    check(img.colorspace_settings.name == "Non-Color", "image is Non-Color, as a normal map must be")
+    check(img.packed_file is not None, "image is packed into the blend")
+
+mat = low.data.materials[0] if low.data.materials else None
+check(mat is not None, "low-poly got a material")
+if mat:
+    kinds = [n.type for n in mat.node_tree.nodes]
+    check("NORMAL_MAP" in kinds, "a Normal Map node was created")
+    linked = any(l.to_node.type == "BSDF_PRINCIPLED" and l.to_socket.name == "Normal"
+                 for l in mat.node_tree.links)
+    check(linked, "the normal map is wired into the shader, so it is actually visible")
+
+check(bpy.context.scene.render.engine == engine_before,
+      "render engine handed back (%s)" % bpy.context.scene.render.engine)
+check(bpy.data.objects["Bumpy"].hide_get(), "the sculpt was hidden again after baking")
+
 print("\n%d check(s), %d failure(s)" % (checks, len(failures)))
 if failures:
+    for f in failures: print("FAILED: " + f)
     sys.exit(1)
 print("ALL CHECKS PASSED")
