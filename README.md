@@ -39,10 +39,19 @@ original is hidden rather than deleted.
 
 ## Install
 
-Edit ▸ Preferences ▸ Add-ons ▸ Install, choose `retopo_kit/__init__.py`, enable it.
-Press **N** in the 3D viewport and open the **Retopo** tab.
+Build the zip, then install that — **not** the loose `__init__.py`, which Blender
+registers under the wrong name and never shows in the sidebar:
 
-Blender 3.6 or newer. Developed against Blender 5.2.1 LTS.
+```bash
+./build.sh          # writes dist/retopo_kit-<version>.zip
+```
+
+Blender 4.2+ — Edit ▸ Preferences ▸ Get Extensions ▸ ⌄ ▸ Install from Disk
+Blender 3.6–4.1 — Edit ▸ Preferences ▸ Add-ons ▸ Install
+
+Then press **N** in the 3D viewport and open the **Retopo** tab.
+
+Blender 3.6 or newer. Verified installing and enabling on Blender 5.2.1 LTS.
 
 ## Test
 
