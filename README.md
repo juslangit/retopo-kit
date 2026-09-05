@@ -10,7 +10,7 @@ Retopo Kit uses that remesher as its engine and does the rest of the chain.
 
 ## Status
 
-**In development.** Steps 1 to 4 of 5 work.
+**All five steps work.** Sculpt to game-ready in one press.
 
 | Step | What it does | Status |
 |---|---|---|
@@ -18,7 +18,7 @@ Retopo Kit uses that remesher as its engine and does the rest of the chain.
 | 2 | Automatic UV unwrap on the low-poly | ✅ done |
 | 3 | Bake the sculpt's detail into a normal map | ✅ done |
 | 4 | Run the whole chain over a selection, not one object | ✅ done |
-| 5 | Generate LODs with Unreal's naming | planned |
+| 5 | Generate LODs with Unreal's naming | ✅ done |
 
 ## Step 1 — remesh by quad size
 
@@ -78,6 +78,21 @@ Low-polys are skipped, so running it twice cannot produce `LP_LP_Rock`.
 
 Every button goes through the same code path as the batch, so the single-object
 case and the forty-object case cannot behave differently.
+
+## Step 5 — distance versions
+
+`LP_Rock_LOD0`, `LP_Rock_LOD1`, `LP_Rock_LOD2` — the naming Unreal reads.
+
+Each level is **reduced from the one above, not rebuilt from the sculpt.** That is
+the whole point: reducing the existing mesh keeps its UVs, so every level shares the
+one normal map you already baked. Remeshing each level would give each its own UVs
+and need its own texture, which is not how LODs work.
+
+Counts are shown in triangles rather than faces, because decimating turns quads into
+triangles — 7,690 quads become 15,380 triangles, and halving that gives 7,690
+triangles, the same number in a different unit. Triangles are what the engine draws.
+
+The reduced levels are hidden after building, since they sit exactly on top of LOD0.
 
 ## Install
 

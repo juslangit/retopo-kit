@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "retopo_kit"
-version = "0.4.0"
+version = "0.5.0"
 name = "Retopo Kit"
 tagline = "One press from sculpt to game-ready"
 maintainer = "Luqman Hakeem <academy@todak.com>"

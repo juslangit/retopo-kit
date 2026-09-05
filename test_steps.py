@@ -191,6 +191,56 @@ for obj in bpy.context.view_layer.objects:
 bpy.ops.retopo.batch()
 check("LP_LP_Good" not in bpy.data.objects, "low-polys are not re-processed")
 
+# --- step 5: LODs ---------------------------------------------------------
+bpy.ops.wm.read_factory_settings(use_empty=True)
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake, s.auto_lods = "PROP", True, False, False
+bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, segments=48, ring_count=24)
+bpy.context.active_object.name = "Statue"
+bpy.ops.retopo.remesh()
+
+low = bpy.data.objects["LP_Statue"]
+bpy.context.view_layer.objects.active = low
+s.lod_count, s.lod_ratio = "2", 0.5
+check(bpy.ops.retopo.lods() == {"FINISHED"}, "LODs built")
+
+names = ["LP_Statue_LOD0", "LP_Statue_LOD1", "LP_Statue_LOD2"]
+check(all(n in bpy.data.objects for n in names),
+      "named the way Unreal reads them: %s" % ", ".join(names))
+
+def triangles(obj):
+    # Decimate turns quads into triangles, so face counts are not comparable
+    # across levels. Triangles are what the engine draws, and what LOD ratios
+    # are actually measured in.
+    return sum(len(p.vertices) - 2 for p in obj.data.polygons)
+
+counts = [triangles(bpy.data.objects[n]) for n in names]
+check(counts[0] > counts[1] > counts[2], "each level is lighter (%s tris)" % counts)
+check(abs(counts[1] / counts[0] - 0.5) < 0.15,
+      "LOD1 is roughly half of LOD0 (%.2f)" % (counts[1] / counts[0]))
+
+check(all(bpy.data.objects[n].data.uv_layers for n in names),
+      "every level kept its UVs, so they can share one texture")
+mats = [bpy.data.objects[n].data.materials[0] if bpy.data.objects[n].data.materials
+        else None for n in names]
+check(len(set(id(m) for m in mats)) == 1, "every level shares the same material")
+check(all(bpy.data.objects[n].hide_get() for n in names[1:]),
+      "the reduced levels are hidden so they do not obscure LOD0")
+check(not bpy.data.objects["LP_Statue_LOD0"].modifiers, "no leftover modifier stack")
+
+# running the chain end to end, everything on
+bpy.ops.wm.read_factory_settings(use_empty=True)
+s = bpy.context.scene.retopo
+s.preset, s.auto_unwrap, s.auto_bake, s.auto_lods = "PROP", True, True, True
+s.texture_size, s.lod_count = "1024", "2"
+bpy.ops.mesh.primitive_uv_sphere_add(radius=0.5, segments=48, ring_count=24)
+bpy.context.active_object.name = "Whole"
+check(bpy.ops.retopo.remesh() == {"FINISHED"}, "the whole chain runs in one press")
+check("LP_Whole_LOD0" in bpy.data.objects, "chain produced LOD0")
+check("LP_Whole_LOD2" in bpy.data.objects, "chain produced LOD2")
+check(bpy.data.images.get("LP_Whole_Normal") is not None, "chain produced the normal map")
+check("LODs" in s.last_report, "the summary mentions every stage: '%s'" % s.last_report)
+
 print("\n%d check(s), %d failure(s)" % (checks, len(failures)))
 if failures:
     for f in failures: print("FAILED: " + f)

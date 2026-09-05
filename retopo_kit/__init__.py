@@ -15,13 +15,16 @@ number to guess at.
 Step 4, batch: the whole chain runs over every selected sculpt, and one bad object
 reports itself instead of stopping the rest.
 
+Step 5, LODs: the distance versions are reduced from the finished low-poly rather
+than rebuilt, so every level shares one set of UVs and one normal map.
+
 The sculpt is never modified. The result is a new object named LP_<name>.
 """
 
 bl_info = {
     "name": "Retopo Kit",
     "author": "Luqman Hakeem",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar (N) > Retopo",
     "description": "Sculpt to game-ready: remesh, unwrap, bake, over a whole selection.",
@@ -118,6 +121,22 @@ class RETOPO_Settings(PropertyGroup):
                     "short and you get black patches; too long and rays hit the "
                     "far side of the model",
         default=2.0, min=0.01, max=100.0, soft_max=20.0)
+
+    # --- step 5: LODs ---
+    auto_lods: BoolProperty(
+        name="Make LODs", default=False,
+        description="Also build the reduced distance versions Unreal expects")
+    lod_count: EnumProperty(
+        name="Levels", default="2",
+        description="How many reduced versions to build below the full one",
+        items=[("1", "1", "LOD0 and LOD1"),
+               ("2", "2", "LOD0, LOD1 and LOD2"),
+               ("3", "3", "LOD0 through LOD3")])
+    lod_ratio: FloatProperty(
+        name="Each Level Keeps",
+        description="How much of the previous level each step keeps. 0.5 means "
+                    "every level is half the faces of the one above it",
+        default=0.5, min=0.1, max=0.9, subtype="FACTOR")
 
     last_report: StringProperty(default="")
 
@@ -397,13 +416,99 @@ def find_source(context, low):
 
 
 # --------------------------------------------------------------------------- #
+# Step 5 — distance versions
+# --------------------------------------------------------------------------- #
+
+def apply_modifiers(context, obj):
+    """Bake obj's modifier stack into its mesh, without going through operators."""
+    context.view_layer.update()
+    depsgraph = context.evaluated_depsgraph_get()
+    baked = bpy.data.meshes.new_from_object(
+        obj.evaluated_get(depsgraph), preserve_all_data_layers=True,
+        depsgraph=depsgraph)
+    previous = obj.data
+    obj.data = baked
+    obj.data.name = obj.name
+    obj.modifiers.clear()
+    if previous.users == 0:
+        bpy.data.meshes.remove(previous)
+
+
+def make_lods(context, low, settings):
+    """Build the reduced versions, named the way Unreal reads them.
+
+    Each level is decimated down from the one above rather than remeshed from the
+    sculpt. That matters: reducing the existing mesh keeps the UVs, so every level
+    shares the single normal map that was already baked. Remeshing each level
+    would need its own unwrap and its own texture, which is not how LODs work.
+    """
+    levels = int(settings.lod_count)
+    base = low.name[:-5] if low.name.endswith("_LOD0") else low.name
+
+    if not low.name.endswith("_LOD0"):
+        low.name = base + "_LOD0"
+        low.data.name = low.name
+
+    made = [low]
+    previous = low
+    for level in range(1, levels + 1):
+        copy = previous.copy()
+        copy.data = previous.data.copy()
+        copy.name = "%s_LOD%d" % (base, level)
+        copy.data.name = copy.name
+        copy.pop("retopo_source", None)
+        for collection in previous.users_collection:
+            collection.objects.link(copy)
+
+        decimate = copy.modifiers.new("LOD", "DECIMATE")
+        decimate.decimate_type = "COLLAPSE"
+        decimate.ratio = settings.lod_ratio
+        decimate.use_collapse_triangulate = True
+        apply_modifiers(context, copy)
+
+        copy.hide_set(True)      # they sit on top of each other otherwise
+        made.append(copy)
+        previous = copy
+
+    return made
+
+
+class RETOPO_OT_lods(Operator):
+    bl_idname = "retopo.lods"
+    bl_label = "Make LODs"
+    bl_description = "Build the reduced distance versions from this low-poly"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH" and context.mode == "OBJECT"
+
+    def execute(self, context):
+        settings = context.scene.retopo
+        low = context.active_object
+
+        if len(low.data.polygons) > 200000:
+            self.report({"ERROR"}, "Remesh this before building LODs from it")
+            return {"CANCELLED"}
+
+        made = make_lods(context, low, settings)
+        counts = " to ".join(f"{len(o.data.polygons):,}" for o in made)
+        settings.last_report = "%s: %d levels, %s faces" % (
+            made[0].name[:-5], len(made), counts)
+        self.report({"INFO"}, settings.last_report)
+        return {"FINISHED"}
+
+
+# --------------------------------------------------------------------------- #
 # Step 1 — the remesh operator
 # --------------------------------------------------------------------------- #
 
 class Result:
     """What happened to one sculpt, so a batch can report on all of them."""
 
-    __slots__ = ("source", "low", "before", "after", "coverage", "baked", "problem")
+    __slots__ = ("source", "low", "before", "after", "coverage", "baked",
+                 "lods", "problem")
 
     def __init__(self, source):
         self.source = source
@@ -412,6 +517,7 @@ class Result:
         self.after = 0
         self.coverage = None
         self.baked = False
+        self.lods = 0
         self.problem = None
 
     @property
@@ -480,6 +586,13 @@ def process(context, source, settings, report=None):
                 result.problem = "bake failed (%s)" % exc
                 return result
 
+    if settings.auto_lods:
+        try:
+            result.lods = len(make_lods(context, low, settings))
+        except RuntimeError as exc:
+            result.problem = "LODs failed (%s)" % exc
+            return result
+
     if settings.keep_original:
         source.hide_set(True)
     else:
@@ -497,6 +610,8 @@ def describe(result):
         parts.append("UVs %.0f%%" % result.coverage)
     if result.baked:
         parts.append("baked")
+    if result.lods:
+        parts.append("%d LODs" % result.lods)
     return "%s: %s" % (result.low.name, ", ".join(parts))
 
 
@@ -682,9 +797,41 @@ class RETOPO_PT_bake(Panel):
         layout.operator("retopo.bake", icon="RENDER_STILL")
 
 
+class RETOPO_PT_lods(Panel):
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Retopo"
+    bl_label = "Distance Versions"
+    bl_parent_id = "RETOPO_PT_main"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.retopo
+        obj = context.active_object
+
+        layout.prop(settings, "auto_lods")
+        row = layout.row(align=True)
+        row.prop(settings, "lod_count")
+        layout.prop(settings, "lod_ratio", slider=True)
+
+        # Show what the levels will actually come out at. Counted in triangles,
+        # because decimating turns the quads into triangles and that is what the
+        # ratio applies to — and what the engine ends up drawing.
+        if obj is not None and obj.type == "MESH":
+            tris = sum(len(p.vertices) - 2 for p in obj.data.polygons)
+            box = layout.box()
+            for level in range(int(settings.lod_count) + 1):
+                box.label(text="LOD%d: %s tris" % (level, f"{int(tris):,}"))
+                tris *= settings.lod_ratio
+
+        layout.operator("retopo.lods", icon="MOD_DECIM")
+
+
 CLASSES = (RETOPO_Settings,
            RETOPO_OT_remesh, RETOPO_OT_batch, RETOPO_OT_unwrap, RETOPO_OT_bake,
-           RETOPO_PT_main, RETOPO_PT_unwrap, RETOPO_PT_bake)
+           RETOPO_OT_lods,
+           RETOPO_PT_main, RETOPO_PT_unwrap, RETOPO_PT_bake, RETOPO_PT_lods)
 
 
 def register():
