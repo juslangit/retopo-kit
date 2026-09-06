@@ -10,7 +10,7 @@ Retopo Kit uses that remesher as its engine and does the rest of the chain.
 
 ## Status
 
-**All five steps work.** Sculpt to game-ready in one press.
+**v1.0.0.** Sculpt to game-ready in one press, verified on real sculpts.
 
 | Step | What it does | Status |
 |---|---|---|
@@ -93,6 +93,14 @@ triangles — 7,690 quads become 15,380 triangles, and halving that gives 7,690
 triangles, the same number in a different unit. Triangles are what the engine draws.
 
 The reduced levels are hidden after building, since they sit exactly on top of LOD0.
+
+## Known limitation: Quadriflow is not deterministic
+
+Blender's Quadriflow returns a different mesh each run for identical input, even
+with the seed pinned, and sometimes lands well under the face count you asked for —
+in testing, one sphere gave 4,197, 3,131 and 1,094 faces across three identical
+runs. This is inside Blender's C++ implementation and cannot be corrected from an
+add-on. If a result comes out too coarse, run it again.
 
 ## Sculpts that Quadriflow refuses
 

@@ -24,7 +24,7 @@ The sculpt is never modified. The result is a new object named LP_<name>.
 bl_info = {
     "name": "Retopo Kit",
     "author": "Luqman Hakeem",
-    "version": (0, 6, 0),
+    "version": (1, 0, 0),
     "blender": (3, 6, 0),
     "location": "3D View > Sidebar (N) > Retopo",
     "description": "Sculpt to game-ready: remesh, unwrap, bake, over a whole selection.",
@@ -604,6 +604,11 @@ def process(context, source, settings, report=None):
             use_preserve_sharp=settings.preserve_sharp,
             use_preserve_boundary=True,
             smooth_normals=True,
+            # Pinning the seed removes one source of randomness, but not all of
+            # it: Blender's Quadriflow still returns different face counts run to
+            # run for identical input, sometimes well under the target. That is
+            # inside its C++ implementation and cannot be fixed from here.
+            seed=0,
         )
     except RuntimeError:
         outcome = {"CANCELLED"}
